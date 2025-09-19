@@ -30,33 +30,49 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self):
-        """
-        Optimized weight update using SHARDED_STATE_DICT to avoid memory explosion.
-        
-        Memory optimization:
-        - Before: All GPUs load full model (e.g., 8 × 70B = 560B memory)
-        - After: Each GPU only handles local shards (e.g., 8 × 8.75B = 70B memory)
-        """
+        """Optimized weight update using SHARDED_STATE_DICT to avoid memory explosion."""
         monkey_patch_torch_reductions()
         
         # Use SHARDED_STATE_DICT to avoid loading full model on each GPU
         with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT):
             local_state_dict = self.model.state_dict()
         
-        # Extract parameter metadata for distributed weight update
-        param_names = list(local_state_dict.keys())
-        param_dtypes = [param.dtype for param in local_state_dict.values()]
-        param_shapes = [param.shape for param in local_state_dict.values()]
+        # Gather all shards to reconstruct full parameters
+        all_shards = [None] * dist.get_world_size(self._ipc_gather_group)
+        dist.all_gather_object(all_shards, local_state_dict, group=self._ipc_gather_group)
         
-        # Only the gather source rank communicates with SGLang engines
         if dist.get_rank() == self._ipc_gather_src:
-            # Use SGLang's distributed weight update for memory-efficient parameter sharing
+            # Reconstruct full parameters from shards
+            full_params = {}
+            for shard in all_shards:
+                if shard is not None:
+                    full_params.update(shard)
+            
+            # Initialize distributed communication group for weight updates
+            group_name = f"fsdp_update_group_{id(self)}"
             for engine in self.rollout_engines:
-                ref = engine.update_weights_from_distributed.remote(
-                    names=param_names,
-                    dtypes=param_dtypes,
-                    shapes=param_shapes,
-                    group_name=f"fsdp_update_group_{id(self)}",
-                    flush_cache=True  # Ensure cache is cleared after update
+                # Setup distributed group
+                ref = engine.init_weights_update_group.remote(
+                    master_address="localhost",
+                    master_port=0,
+                    rank_offset=0,
+                    world_size=dist.get_world_size(self._ipc_gather_group),
+                    group_name=group_name,
+                    backend="nccl" if torch.cuda.is_available() else "gloo"
                 )
                 ray.get(ref)
+            
+            # Send parameter metadata to SGLang
+            for engine in self.rollout_engines:
+                ref = engine.update_weights_from_distributed.remote(
+                    names=list(full_params.keys()),
+                    dtypes=[param.dtype for param in full_params.values()],
+                    shapes=[param.shape for param in full_params.values()],
+                    group_name=group_name,
+                    flush_cache=True
+                )
+                ray.get(ref)
+            
+            # Broadcast actual parameter data
+            for param in full_params.values():
+                dist.broadcast(param.data, src=self._ipc_gather_src, group=self._ipc_gather_group)
