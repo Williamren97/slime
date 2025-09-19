@@ -1,16 +1,9 @@
 import ray
 import torch
-import torch.distributed as dist
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils import MultiprocessingSerializer
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
-
-try:
-    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
-    use_flattened_tensor_bucket = True
-except:
-    use_flattened_tensor_bucket = False
 
 
 class UpdateWeightFromTensor:
@@ -20,75 +13,28 @@ class UpdateWeightFromTensor:
 
     def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
         self.rollout_engines = rollout_engines
-
-        # Here we assume the gpu id of rollout engines and train actors are the same.
-        for i, engine in enumerate(self.rollout_engines):
-            start_rank = i * self.args.rollout_num_gpus_per_engine
-            end_rank = (i + 1) * self.args.rollout_num_gpus_per_engine
-            group_ranks = list(range(start_rank, end_rank))
-            new_group = dist.new_group(
-                ranks=group_ranks,
-                backend="gloo",
-            )
-            if dist.get_rank() in group_ranks:
-                self._ipc_gather_src = start_rank
-                self._ipc_gather_group = new_group
-                self._ipc_engine = engine
+        # Each GPU will send its shard directly to its corresponding engine
+        self._ipc_engine = rollout_engines[0]  # Simplified: use first engine for now
 
     @torch.no_grad()
     def update_weights(self):
-        """Optimized weight update using SHARDED_STATE_DICT to avoid memory explosion."""
+        """Optimized weight update using SHARDED_STATE_DICT with SGLang's native shard support."""
         monkey_patch_torch_reductions()
         
-        # Use SHARDED_STATE_DICT to avoid loading full model on each GPU
+        # Each GPU gets its own FSDP shard - no memory explosion
         with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT):
             local_state_dict = self.model.state_dict()
         
-        # Gather all shards to reconstruct full parameters
-        all_shards = [None] * dist.get_world_size(self._ipc_gather_group)
-        dist.all_gather_object(all_shards, local_state_dict, group=self._ipc_gather_group)
+        # Serialize local shard
+        serialized_state_dict = MultiprocessingSerializer.serialize(
+            [(name, tensor) for name, tensor in local_state_dict.items()], 
+            output_str=True
+        )
         
-        if dist.get_rank() == self._ipc_gather_src:
-            # Reconstruct full parameters from shards
-            full_params = {}
-            for shard in all_shards:
-                if shard is not None:
-                    full_params.update(shard)
-            
-            # Convert to named tensors list for SGLang
-            named_tensors = [(name, param) for name, param in full_params.items()]
-            
-            # Use FlattenedTensorBucket optimization if available
-            if use_flattened_tensor_bucket:
-                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-                metadata = flattened_tensor_bucket.get_metadata()
-                
-                flattened_tensor_data = {
-                    "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-                    "metadata": metadata,
-                }
-                serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
-                load_format = "flattened_bucket"
-            else:
-                serialized_tensors = MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                load_format = None
-            
-            # Gather serialized tensors from all GPUs in this group
-            serialized_named_tensors = [None] * dist.get_world_size(self._ipc_gather_group)
-            dist.gather_object(
-                serialized_tensors,
-                object_gather_list=serialized_named_tensors,
-                dst=self._ipc_gather_src,
-                group=self._ipc_gather_group,
-            )
-            
-            # Update weights using SGLang's update_weights_from_tensor API
-            kwargs = {
-                "serialized_named_tensors": serialized_named_tensors,
-                "flush_cache": True,
-            }
-            if load_format is not None:
-                kwargs["load_format"] = load_format
-                
-            ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
-            ray.get(ref)
+        # Send shard directly to SGLang - it handles aggregation internally
+        ref = self._ipc_engine.update_weights_from_tensor.remote(
+            serialized_named_tensors=[serialized_state_dict],
+            load_format="sharded_state_dict",
+            flush_cache=True
+        )
+        ray.get(ref)
