@@ -2,8 +2,15 @@ import ray
 import torch
 import torch.distributed as dist
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils import MultiprocessingSerializer
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
+
+try:
+    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
+    use_flattened_tensor_bucket = True
+except:
+    use_flattened_tensor_bucket = False
 
 
 class UpdateWeightFromTensor:
@@ -48,31 +55,40 @@ class UpdateWeightFromTensor:
                 if shard is not None:
                     full_params.update(shard)
             
-            # Initialize distributed communication group for weight updates
-            group_name = f"fsdp_update_group_{id(self)}"
-            for engine in self.rollout_engines:
-                # Setup distributed group
-                ref = engine.init_weights_update_group.remote(
-                    master_address="localhost",
-                    master_port=0,
-                    rank_offset=0,
-                    world_size=dist.get_world_size(self._ipc_gather_group),
-                    group_name=group_name,
-                    backend="nccl" if torch.cuda.is_available() else "gloo"
-                )
-                ray.get(ref)
+            # Convert to named tensors list for SGLang
+            named_tensors = [(name, param) for name, param in full_params.items()]
             
-            # Send parameter metadata to SGLang
-            for engine in self.rollout_engines:
-                ref = engine.update_weights_from_distributed.remote(
-                    names=list(full_params.keys()),
-                    dtypes=[param.dtype for param in full_params.values()],
-                    shapes=[param.shape for param in full_params.values()],
-                    group_name=group_name,
-                    flush_cache=True
-                )
-                ray.get(ref)
+            # Use FlattenedTensorBucket optimization if available
+            if use_flattened_tensor_bucket:
+                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+                metadata = flattened_tensor_bucket.get_metadata()
+                
+                flattened_tensor_data = {
+                    "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                    "metadata": metadata,
+                }
+                serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+                load_format = "flattened_bucket"
+            else:
+                serialized_tensors = MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+                load_format = None
             
-            # Broadcast actual parameter data
-            for param in full_params.values():
-                dist.broadcast(param.data, src=self._ipc_gather_src, group=self._ipc_gather_group)
+            # Gather serialized tensors from all GPUs in this group
+            serialized_named_tensors = [None] * dist.get_world_size(self._ipc_gather_group)
+            dist.gather_object(
+                serialized_tensors,
+                object_gather_list=serialized_named_tensors,
+                dst=self._ipc_gather_src,
+                group=self._ipc_gather_group,
+            )
+            
+            # Update weights using SGLang's update_weights_from_tensor API
+            kwargs = {
+                "serialized_named_tensors": serialized_named_tensors,
+                "flush_cache": True,
+            }
+            if load_format is not None:
+                kwargs["load_format"] = load_format
+                
+            ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
+            ray.get(ref)
