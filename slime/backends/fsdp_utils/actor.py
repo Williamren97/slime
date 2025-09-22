@@ -3,10 +3,19 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from PIL import Image
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy, StateDictType
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+
+# FSDP imports
+from torch.distributed.fsdp.api import ShardingStrategy, StateDictType
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
+# Import FSDP version utilities
+from .fsdp_version_utils import (
+    create_fsdp_model,
+    get_fsdp_state_dict_context,
+    preprocess_tensor_for_update_weights
+)
 
 import wandb
 from slime.ray.registry import get_actors
@@ -65,17 +74,8 @@ class FSDPTrainRayActor(TrainRayActor):
         # TODO: set correct auto_wrap_policy
         auto_wrap_policy = None
 
-        self.model = FSDP(
-            model,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=torch.cuda.current_device(),
-            use_orig_params=True,
-            sharding_strategy=ShardingStrategy[self.args.fsdp_sharding_strategy],
-            cpu_offload=self.args.fsdp_cpu_offload,
-            forward_prefetch=self.args.fsdp_forward_prefetch,
-            backward_prefetch=self.args.fsdp_backward_prefetch,
-            limit_all_gathers=self.args.fsdp_limit_all_gathers,
-        )
+        # Create FSDP model using version-aware utility
+        self.model = create_fsdp_model(model, self.args, auto_wrap_policy)
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -95,7 +95,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.update_cpu_params_dict(self.weights["actor"])
 
-        self.weight_updator = UpdateWeightFromTensor(self.args, self.model)
+        self.weight_updator = UpdateWeightFromTensor(self.args, self.model, full_params=self.args.fsdp_full_params)
         self.connected = False
 
         if self.args.offload:
@@ -406,10 +406,14 @@ class FSDPTrainRayActor(TrainRayActor):
     @torch.no_grad()
     def update_cpu_params_dict(self, params_dict):
         """Copy model parameters from GPU to CPU storage dictionary"""
-        with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT):
+        # Use version-aware context manager
+        with get_fsdp_state_dict_context(self.model, full_state_dict=True):
             state_dict = self.model.state_dict()
 
         for name, param in state_dict.items():
+            # Handle different tensor types using utils
+            param = preprocess_tensor_for_update_weights(param)
+                
             if name not in params_dict:
                 params_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
             params_dict[name].copy_(param.detach(), non_blocking=True)
