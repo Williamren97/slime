@@ -17,7 +17,6 @@ class FSDPArgs:
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
     warmup_ratio: float = 0.03
-    clip_grad: float = 1.0
 
     # FSDP specific
     fsdp_wrap: str = "transformer_blocks"  # future use: auto wrap policy
@@ -27,6 +26,9 @@ class FSDPArgs:
     fsdp_sync_module_states: bool = True
     fsdp_forward_prefetch: bool = True
     fsdp_backward_prefetch: bool = True
+    
+    # FSDP state dict configuration
+    fsdp_full_params: bool = False  # Use FULL_STATE_DICT (True) or SHARDED_STATE_DICT (False) - default to sharded
 
     # Logging
     wandb_project: str = "slime-fsdp"
