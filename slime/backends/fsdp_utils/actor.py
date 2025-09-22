@@ -12,8 +12,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataP
 
 # Import FSDP version utilities
 from .fsdp_version_utils import (
-    create_fsdp_model,
-    get_fsdp_state_dict_context,
+    create_fsdp_v2_model,
     preprocess_tensor_for_update_weights
 )
 
@@ -74,8 +73,10 @@ class FSDPTrainRayActor(TrainRayActor):
         # TODO: set correct auto_wrap_policy
         auto_wrap_policy = None
 
-        # Create FSDP model using version-aware utility
-        self.model = create_fsdp_model(model, self.args, auto_wrap_policy)
+        # Create FSDP v2 model using fully_shard
+        self.model = create_fsdp_v2_model(model)
+
+
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -406,9 +407,8 @@ class FSDPTrainRayActor(TrainRayActor):
     @torch.no_grad()
     def update_cpu_params_dict(self, params_dict):
         """Copy model parameters from GPU to CPU storage dictionary"""
-        # Use version-aware context manager
-        with get_fsdp_state_dict_context(self.model, full_state_dict=True):
-            state_dict = self.model.state_dict()
+        # FSDP v2 doesn't need context managers - get state dict directly
+        state_dict = self.model.state_dict()
 
         for name, param in state_dict.items():
             # Handle different tensor types using utils

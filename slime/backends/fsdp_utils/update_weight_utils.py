@@ -10,15 +10,10 @@ try:
     use_flattened_tensor_bucket = True
 except ImportError:
     use_flattened_tensor_bucket = False
-from torch.distributed.fsdp.api import StateDictType
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-
-# Note: Using the working FSDP imports from our main imports above
+# Note: FSDP v1 imports removed - we only support FSDP v2
 
 # Import FSDP version utilities
 from .fsdp_version_utils import (
-    fsdp_version,
-    get_fsdp_state_dict_context,
     preprocess_tensor_for_update_weights as _preprocess_tensor_for_update_weights,
 )
 
@@ -44,13 +39,47 @@ class UpdateWeightFromTensor:
         self.model = model
         self.full_params = full_params
         
-        # Detect FSDP version
-        self.model_fsdp_version = fsdp_version(self.model)
-        logger.info(f"Detected FSDP version: {self.model_fsdp_version}")
+        # Verify FSDP v2 (will raise error if not FSDP v2)
+        self._verify_fsdp_v2()
+        logger.info("Detected FSDP version: 2")
             
         # Set up tensor parallel configuration for SGLang
         self.tp_size = args.rollout_num_gpus_per_engine
         # tp_rank will be set during connect_rollout_engines based on the IPC group
+
+    def _verify_fsdp_v2(self):
+        """Verify model is FSDP v2, raise error if not."""
+        # Import FSDP v2 components
+        try:
+            from packaging import version
+            if version.parse(torch.__version__) >= version.parse("2.6"):
+                from torch.distributed.fsdp import FSDPModule
+            elif version.parse(torch.__version__) >= version.parse("2.4"):
+                from torch.distributed._composable.fsdp import FSDPModule
+            else:
+                FSDPModule = None
+        except ImportError:
+            FSDPModule = None
+        
+        # Check for FSDP v1 (deprecated)
+        try:
+            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+            if isinstance(self.model, FSDP):
+                raise RuntimeError(
+                    "FSDP v1 is no longer supported. Please upgrade to FSDP v2 (fully_shard). "
+                    f"Detected PyTorch version: {torch.__version__}. "
+                    "FSDP v2 is available in PyTorch >= 2.4."
+                )
+        except ImportError:
+            pass  # FSDP v1 not available, which is fine
+        
+        # Check for FSDP v2
+        if not (FSDPModule is not None and isinstance(self.model, FSDPModule)):
+            raise RuntimeError(
+                "Model is not wrapped with FSDP v2 (fully_shard). "
+                f"Detected PyTorch version: {torch.__version__}. "
+                "Please use fully_shard() to wrap your model."
+            )
 
     def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
         self.rollout_engines = rollout_engines
@@ -78,11 +107,10 @@ class UpdateWeightFromTensor:
         # Get state dict based on configuration
         if self.full_params:
             logger.info("Using FULL_STATE_DICT path")
-            # Use version-aware context manager for FSDP state dict
-            with get_fsdp_state_dict_context(self.model, full_state_dict=True):
-                state_dict = self.model.state_dict()
-                # Preprocess tensors to handle DTensor/ShardedTensor -> full tensor conversion
-                named_tensors = [(name, _preprocess_tensor_for_update_weights(param)) for name, param in state_dict.items()]
+            # FSDP v2 doesn't need context managers - get state dict directly
+            state_dict = self.model.state_dict()
+            # Preprocess tensors to handle DTensor -> full tensor conversion
+            named_tensors = [(name, _preprocess_tensor_for_update_weights(param)) for name, param in state_dict.items()]
 
             if use_flattened_tensor_bucket:
                 flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
