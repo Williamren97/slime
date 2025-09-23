@@ -2,6 +2,9 @@ import ray
 import torch
 import torch.distributed as dist
 import logging
+import gc
+import psutil
+import os
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils import MultiprocessingSerializer
 
@@ -15,11 +18,24 @@ except ImportError:
 # Import FSDP version utilities
 from .fsdp_version_utils import (
     preprocess_tensor_for_update_weights as _preprocess_tensor_for_update_weights,
+    verify_model_is_fsdp_v2,
 )
 
 # Set up logger for FSDP weight updates
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+def log_memory_usage(phase_name: str):
+    """Simple memory logging for OOM debugging."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+        logger.info(f"[{phase_name}] GPU: {allocated:.1f}GB used, {reserved:.1f}GB reserved, {total-reserved:.1f}GB free")
+    
+    # System memory
+    sys_mem = psutil.virtual_memory()
+    logger.info(f"[{phase_name}] System: {sys_mem.used/1024**3:.1f}GB used, {sys_mem.available/1024**3:.1f}GB available")
 
 try:
     from sglang.srt.model_executor.model_runner import FlattenedTensorBucket, LocalSerializedTensor
@@ -40,46 +56,14 @@ class UpdateWeightFromTensor:
         self.full_params = full_params
         
         # Verify FSDP v2 (will raise error if not FSDP v2)
-        self._verify_fsdp_v2()
+        verify_model_is_fsdp_v2(model)
         logger.info("Detected FSDP version: 2")
+        logger.info(f"Full params mode: {self.full_params}")
             
         # Set up tensor parallel configuration for SGLang
         self.tp_size = args.rollout_num_gpus_per_engine
         # tp_rank will be set during connect_rollout_engines based on the IPC group
 
-    def _verify_fsdp_v2(self):
-        """Verify model is FSDP v2, raise error if not."""
-        # Import FSDP v2 components
-        try:
-            from packaging import version
-            if version.parse(torch.__version__) >= version.parse("2.6"):
-                from torch.distributed.fsdp import FSDPModule
-            elif version.parse(torch.__version__) >= version.parse("2.4"):
-                from torch.distributed._composable.fsdp import FSDPModule
-            else:
-                FSDPModule = None
-        except ImportError:
-            FSDPModule = None
-        
-        # Check for FSDP v1 (deprecated)
-        try:
-            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-            if isinstance(self.model, FSDP):
-                raise RuntimeError(
-                    "FSDP v1 is no longer supported. Please upgrade to FSDP v2 (fully_shard). "
-                    f"Detected PyTorch version: {torch.__version__}. "
-                    "FSDP v2 is available in PyTorch >= 2.4."
-                )
-        except ImportError:
-            pass  # FSDP v1 not available, which is fine
-        
-        # Check for FSDP v2
-        if not (FSDPModule is not None and isinstance(self.model, FSDPModule)):
-            raise RuntimeError(
-                "Model is not wrapped with FSDP v2 (fully_shard). "
-                f"Detected PyTorch version: {torch.__version__}. "
-                "Please use fully_shard() to wrap your model."
-            )
 
     def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
         self.rollout_engines = rollout_engines
@@ -102,6 +86,9 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self):
+        logger.info("Starting weight update")
+        log_memory_usage("WEIGHT_UPDATE_START")
+        
         monkey_patch_torch_reductions()
         
         # Get state dict based on configuration
@@ -109,8 +96,12 @@ class UpdateWeightFromTensor:
             logger.info("Using FULL_STATE_DICT path")
             # FSDP v2 doesn't need context managers - get state dict directly
             state_dict = self.model.state_dict()
+            log_memory_usage("AFTER_STATE_DICT")
+            
             # Preprocess tensors to handle DTensor -> full tensor conversion
             named_tensors = [(name, _preprocess_tensor_for_update_weights(param)) for name, param in state_dict.items()]
+            del state_dict
+            log_memory_usage("AFTER_PREPROCESSING")
 
             if use_flattened_tensor_bucket:
                 flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
@@ -124,6 +115,8 @@ class UpdateWeightFromTensor:
             else:
                 serialized_tensors = MultiprocessingSerializer.serialize(named_tensors, output_str=True)
 
+            log_memory_usage("AFTER_SERIALIZATION")
+
             serialized_named_tensors = (
                 [None] * dist.get_world_size(self._ipc_gather_group) if self._ipc_gather_src == dist.get_rank() else None
             )
@@ -133,6 +126,7 @@ class UpdateWeightFromTensor:
                 dst=self._ipc_gather_src,
                 group=self._ipc_gather_group,
             )
+            log_memory_usage("AFTER_GATHER")
 
             if dist.get_rank() == self._ipc_gather_src:
                 kwargs = {
@@ -143,31 +137,26 @@ class UpdateWeightFromTensor:
 
                 ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
                 ray.get(ref)
+                log_memory_usage("AFTER_SGLANG_UPDATE")
         else:
-            logger.info("Using SHARDED_STATE_DICT path (veRL-style)")
+            logger.info("Using SHARDED_STATE_DICT path")
             # Use SHARDED_STATE_DICT following veRL pattern
             params = self.model.state_dict()
-            
-            # Debug: Log what types of tensors we actually get
-            tensor_types = {}
-            for k, v in params.items():
-                tensor_type = type(v).__name__
-                if tensor_type not in tensor_types:
-                    tensor_types[tensor_type] = []
-                tensor_types[tensor_type].append(k)
-            
-            for tensor_type, param_names in tensor_types.items():
-                logger.info(f"Found {len(param_names)} parameters of type {tensor_type}: {param_names[:3]}{'...' if len(param_names) > 3 else ''}")
+            log_memory_usage("AFTER_STATE_DICT")
             
             # Preprocess tensors to handle DTensor/ShardedTensor -> full tensor conversion
             named_tensors = [(k, _preprocess_tensor_for_update_weights(v)) for k, v in params.items()]
+            del params
+            log_memory_usage("AFTER_PREPROCESSING")
             
             # Use veRL-style batched weight update approach
             self._update_weights_sharded(named_tensors)
+        
+        logger.info("Weight update completed")
     
     def _update_weights_sharded(self, named_tensors):
         """Update weights using sharded approach similar to veRL's implementation."""
-        logger.info("Executing veRL-style sharded weight update")
+        logger.info("Starting sharded weight update")
         
         load_format = None
         
@@ -176,6 +165,9 @@ class UpdateWeightFromTensor:
             (name, MultiprocessingSerializer.serialize(tensor))
             for name, tensor in named_tensors
         ]
+        # Clear original tensors to free memory
+        del named_tensors
+        log_memory_usage("AFTER_SERIALIZATION")
 
         # Use IPC group approach to gather tensors from all FSDP ranks
         gathered_serialized_batches = (
@@ -187,6 +179,9 @@ class UpdateWeightFromTensor:
             dst=self._ipc_gather_src,
             group=self._ipc_gather_group,
         )
+        # Clear batch data to free memory
+        del named_tensors_batch
+        log_memory_usage("AFTER_GATHER")
 
         if dist.get_rank() == self._ipc_gather_src:
             # Use zip(*) to "transpose" the data structure following veRL pattern
@@ -202,18 +197,30 @@ class UpdateWeightFromTensor:
                 )
                 for tensor_group in logical_tensors
             ]
+            log_memory_usage("AFTER_TENSOR_PROCESSING")
 
+            # Serialize once and reuse for all TP ranks to avoid memory explosion
+            serialized_update_tensors = MultiprocessingSerializer.serialize(update_tensors, output_str=True)
+            # Clear intermediate data to free memory
+            del update_tensors, gathered_serialized_batches
+            log_memory_usage("AFTER_FINAL_SERIALIZATION")
+            
             kwargs = {
-                "serialized_named_tensors": [MultiprocessingSerializer.serialize(update_tensors, output_str=True) for _ in range(self.tp_size)],
+                "serialized_named_tensors": [serialized_update_tensors for _ in range(self.tp_size)],
                 "load_format": load_format,
                 "flush_cache": False,
             }
 
-            logger.info("Sending LocalSerializedTensor objects to SGLang")
+            logger.info("Sending weights to SGLang")
             ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
             ray.get(ref)
+            log_memory_usage("AFTER_SGLANG_UPDATE")
+            
+            # Clear serialized data
+            del serialized_update_tensors, kwargs
             
             # Flush cache after all updates
             ref = self._ipc_engine.flush_cache.remote()
             ray.get(ref)
-            logger.info("Sharded weight update completed")
+            
+        logger.info("Sharded weight update completed")

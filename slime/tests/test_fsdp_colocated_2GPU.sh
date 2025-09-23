@@ -14,7 +14,10 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=3,4
+
+# Enable basic logging for OOM debugging
+export PYTHONPATH=/root/william_slime:$PYTHONPATH
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-0.6B
 )
@@ -62,7 +65,7 @@ SGLANG_ARGS=(
 MISC_ARGS=(
    # FSDP-specific arguments
    # Set to true for FULL_STATE_DICT mode, false for SHARDED_STATE_DICT mode (default)
-    --fsdp-full-params  # Uncomment this line to enable full params mode
+   # --fsdp-full-params  # Uncomment this line to enable full params mode
    # Comment out the above line to use sharded mode (default)
 )
 

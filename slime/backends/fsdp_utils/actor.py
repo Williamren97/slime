@@ -5,6 +5,7 @@ import torch.distributed as dist
 from PIL import Image
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+import logging
 
 # FSDP imports
 from torch.distributed.fsdp.api import ShardingStrategy, StateDictType
@@ -26,6 +27,21 @@ from slime.utils.timer import Timer, timer
 from slime.utils.wandb_utils import init_wandb_secondary
 
 from .update_weight_utils import UpdateWeightFromTensor
+
+logger = logging.getLogger(__name__)
+
+def log_memory_usage(phase_name: str):
+    """Simple memory logging for OOM debugging."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+        logger.info(f"[{phase_name}] GPU: {allocated:.1f}GB used, {reserved:.1f}GB reserved, {total-reserved:.1f}GB free")
+    
+    # System memory
+    import psutil
+    sys_mem = psutil.virtual_memory()
+    logger.info(f"[{phase_name}] System: {sys_mem.used/1024**3:.1f}GB used, {sys_mem.available/1024**3:.1f}GB available")
 
 
 class FSDPTrainRayActor(TrainRayActor):
@@ -277,9 +293,13 @@ class FSDPTrainRayActor(TrainRayActor):
 
         reported_accum: dict[str, list[torch.Tensor]] = {}
         self.optimizer.zero_grad(set_to_none=True)
+        log_memory_usage("BEFORE_TRAINING_LOOP")
+        
         for mbs_id, batch in enumerate(padded_batches):
+            log_memory_usage(f"BEFORE_FORWARD_BATCH_{mbs_id}")
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = self.model(input_ids=batch["tokens"]).logits
+            log_memory_usage(f"AFTER_FORWARD_BATCH_{mbs_id}")
             log_probs = gather_log_probs(logits, batch["tokens"], self.args.rollout_temperature)
 
             if self.args.advantage_estimator == "gspo":
@@ -325,7 +345,9 @@ class FSDPTrainRayActor(TrainRayActor):
                 reported["kl_loss"] = kl_loss.detach()
 
             loss = loss / grad_accum
+            log_memory_usage(f"BEFORE_BACKWARD_BATCH_{mbs_id}")
             loss.backward()
+            log_memory_usage(f"AFTER_BACKWARD_BATCH_{mbs_id}")
 
             for k, v in reported.items():
                 reported_accum.setdefault(k, []).append(v)
