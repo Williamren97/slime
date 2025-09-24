@@ -19,6 +19,7 @@ from .fsdp_version_utils import (
     preprocess_tensor_for_update_weights as _preprocess_tensor_for_update_weights,
     verify_model_is_fsdp_v2,
 )
+from slime.utils.memory_utils import clear_memory
 
 # Set up logger for FSDP weight updates
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class UpdateWeightFromTensor:
             # Preprocess tensors to handle DTensor -> full tensor conversion
             named_tensors = [(name, _preprocess_tensor_for_update_weights(param)) for name, param in state_dict.items()]
             del state_dict
+            clear_memory()
 
             if use_flattened_tensor_bucket:
                 flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
@@ -99,6 +101,9 @@ class UpdateWeightFromTensor:
                 serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
             else:
                 serialized_tensors = MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+            
+            # Clear memory after serialization
+            clear_memory()
 
             serialized_named_tensors = (
                 [None] * dist.get_world_size(self._ipc_gather_group) if self._ipc_gather_src == dist.get_rank() else None
@@ -109,6 +114,7 @@ class UpdateWeightFromTensor:
                 dst=self._ipc_gather_src,
                 group=self._ipc_gather_group,
             )
+            clear_memory()
 
             if dist.get_rank() == self._ipc_gather_src:
                 kwargs = {
@@ -119,6 +125,7 @@ class UpdateWeightFromTensor:
 
                 ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
                 ray.get(ref)
+                clear_memory()
         else:
             logger.info("Using SHARDED_STATE_DICT path")
             # Use SHARDED_STATE_DICT following veRL pattern
@@ -127,6 +134,7 @@ class UpdateWeightFromTensor:
             # Preprocess tensors to handle DTensor/ShardedTensor -> full tensor conversion
             named_tensors = [(k, _preprocess_tensor_for_update_weights(v)) for k, v in params.items()]
             del params
+            clear_memory()
             
             # Use veRL-style batched weight update approach
             self._update_weights_sharded(named_tensors)
@@ -146,6 +154,7 @@ class UpdateWeightFromTensor:
         ]
         # Clear original tensors to free memory
         del named_tensors
+        clear_memory()
 
         # Use IPC group approach to gather tensors from all FSDP ranks
         gathered_serialized_batches = (
@@ -159,6 +168,7 @@ class UpdateWeightFromTensor:
         )
         # Clear batch data to free memory
         del named_tensors_batch
+        clear_memory()
 
         if dist.get_rank() == self._ipc_gather_src:
             # Use zip(*) to "transpose" the data structure following veRL pattern
@@ -179,6 +189,7 @@ class UpdateWeightFromTensor:
             serialized_update_tensors = MultiprocessingSerializer.serialize(update_tensors, output_str=True)
             # Clear intermediate data to free memory
             del update_tensors, gathered_serialized_batches
+            clear_memory()
             
             kwargs = {
                 "serialized_named_tensors": [serialized_update_tensors for _ in range(self.tp_size)],
@@ -189,12 +200,15 @@ class UpdateWeightFromTensor:
             logger.info("Sending weights to SGLang")
             ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
             ray.get(ref)
+            clear_memory()
             
             # Clear serialized data
             del serialized_update_tensors, kwargs
+            clear_memory()
             
             # Flush cache after all updates
             ref = self._ipc_engine.flush_cache.remote()
             ray.get(ref)
+            clear_memory()
             
         logger.info("Sharded weight update completed")
