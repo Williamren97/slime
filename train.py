@@ -5,9 +5,14 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.ray.registry import register_actor
 from slime.utils.arguments import parse_args
 from slime.utils.wandb_utils import init_wandb_primary
+from slime.utils.profiler import init_global_profiler, shutdown_global_profiler
 
 
 def train(args):
+    # Initialize global profiler if config provided
+    if hasattr(args, 'profiler_config') and args.profiler_config:
+        init_global_profiler(args.profiler_config)
+    
     # allocate the GPUs
     pgs = create_placement_groups(args)
     wandb_run_id = init_wandb_primary(args)
@@ -112,6 +117,9 @@ def train(args):
             or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
         ):
             ray.get(rollout_manager.eval.remote(rollout_id))
+    
+    # Cleanup profiler at end of training
+    shutdown_global_profiler()
 
 
 if __name__ == "__main__":

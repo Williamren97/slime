@@ -1,0 +1,7 @@
+global_profiler:
+  tool: torch_memory
+  save_path: ./mem_snapshots
+  trace_alloc_max_entries: 100000
+  stack_depth: 32
+  context: all
+  stacks: all

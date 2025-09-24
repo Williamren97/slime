@@ -20,6 +20,7 @@ from .fsdp_version_utils import (
     verify_model_is_fsdp_v2,
 )
 from slime.utils.memory_utils import clear_memory
+from slime.utils.profiler import snapshot_memory
 
 # Set up logger for FSDP weight updates
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ class UpdateWeightFromTensor:
         # Set up tensor parallel configuration for SGLang
         self.tp_size = args.rollout_num_gpus_per_engine
         # tp_rank will be set during connect_rollout_engines based on the IPC group
+        
+        # Memory profiler will be initialized externally via global profiler
+        # No need for memory visualization setup here anymore
 
 
     def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
@@ -77,6 +81,9 @@ class UpdateWeightFromTensor:
     def update_weights(self):
         logger.info("Starting weight update")
         
+        # Memory snapshot before weight update
+        snapshot_memory("before_weight_update")
+        
         monkey_patch_torch_reductions()
         
         # Get state dict based on configuration
@@ -89,6 +96,9 @@ class UpdateWeightFromTensor:
             named_tensors = [(name, _preprocess_tensor_for_update_weights(param)) for name, param in state_dict.items()]
             del state_dict
             clear_memory()
+            
+            # Memory snapshot after tensor preprocessing
+            snapshot_memory("after_preprocessing")
 
             if use_flattened_tensor_bucket:
                 flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
@@ -138,6 +148,9 @@ class UpdateWeightFromTensor:
             
             # Use veRL-style batched weight update approach
             self._update_weights_sharded(named_tensors)
+        
+        # Memory snapshot after weight update completion
+        snapshot_memory("after_weight_update")
         
         logger.info("Weight update completed")
     
@@ -212,3 +225,4 @@ class UpdateWeightFromTensor:
             clear_memory()
             
         logger.info("Sharded weight update completed")
+    

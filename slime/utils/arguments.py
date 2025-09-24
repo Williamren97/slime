@@ -706,6 +706,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--profiler-config",
+                type=str,
+                default=None,
+                help="Path to profiler configuration YAML file for memory debugging"
+            )
+            parser.add_argument(
                 "--load-debug-rollout-data",
                 type=str,
                 default=None,

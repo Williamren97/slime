@@ -69,6 +69,11 @@ MISC_ARGS=(
    # Comment out the above line to use sharded mode (default)
 )
 
+PROFILER_ARGS=(
+   # Memory profiling for debugging OOM (using config file)
+   --profiler-config ./profiler_config.yaml
+)
+
 # launch the master node of ray in container
 ray start --head --node-ip-address 127.0.0.1 --num-gpus 2 --disable-usage-stats
 
@@ -89,4 +94,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${GRPO_ARGS[@]} \
    ${DISTRIBUTED_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   ${PROFILER_ARGS[@]}
