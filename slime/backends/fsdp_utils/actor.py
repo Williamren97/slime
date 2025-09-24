@@ -5,6 +5,7 @@ import torch.distributed as dist
 from PIL import Image
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+import logging
 
 # FSDP imports
 from torch.distributed.fsdp.api import ShardingStrategy, StateDictType
@@ -26,6 +27,9 @@ from slime.utils.timer import Timer, timer
 from slime.utils.wandb_utils import init_wandb_secondary
 
 from .update_weight_utils import UpdateWeightFromTensor
+
+logger = logging.getLogger(__name__)
+
 
 
 class FSDPTrainRayActor(TrainRayActor):
@@ -277,6 +281,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         reported_accum: dict[str, list[torch.Tensor]] = {}
         self.optimizer.zero_grad(set_to_none=True)
+        
         for mbs_id, batch in enumerate(padded_batches):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = self.model(input_ids=batch["tokens"]).logits
