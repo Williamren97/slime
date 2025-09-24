@@ -29,6 +29,9 @@ class FSDPArgs:
     
     # FSDP state dict configuration
     fsdp_full_params: bool = False  # Use FULL_STATE_DICT (True) or SHARDED_STATE_DICT (False) - default to sharded
+    
+    # Weight update configuration
+    update_weights_bucket_megabytes: int = 100  # Batch size for weight updates in MB
 
     # Logging
     wandb_project: str = "slime-fsdp"

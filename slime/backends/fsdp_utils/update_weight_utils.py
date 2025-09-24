@@ -146,69 +146,115 @@ class UpdateWeightFromTensor:
         logger.info("Starting sharded weight update")
         
         load_format = None
+        update_weights_bucket_megabytes = getattr(self.args, 'update_weights_bucket_megabytes', 100)
+        update_weights_bucket_bytes = int(update_weights_bucket_megabytes) << 20
         
-        # Serialize tensors on each rank
-        named_tensors_batch = [
-            (name, MultiprocessingSerializer.serialize(tensor))
-            for name, tensor in named_tensors
-        ]
-        # Clear original tensors to free memory
-        del named_tensors
-        clear_memory()
-
-        # Use IPC group approach to gather tensors from all FSDP ranks
-        gathered_serialized_batches = (
-            [None] * dist.get_world_size(self._ipc_gather_group) if self._ipc_gather_src == dist.get_rank() else None
-        )
-        dist.gather_object(
-            named_tensors_batch,
-            object_gather_list=gathered_serialized_batches,
-            dst=self._ipc_gather_src,
-            group=self._ipc_gather_group,
-        )
-        # Clear batch data to free memory
-        del named_tensors_batch
-        clear_memory()
-
-        if dist.get_rank() == self._ipc_gather_src:
-            # Use zip(*) to "transpose" the data structure following veRL pattern
-            logical_tensors = zip(*gathered_serialized_batches, strict=True)
-
-            # Create LocalSerializedTensor objects for each logical tensor
-            update_tensors = [
-                (
-                    tensor_group[0][0],  # Get the name from the first rank's data
-                    LocalSerializedTensor(
-                        values=[rank_part[1] for rank_part in tensor_group]
-                    ),
-                )
-                for tensor_group in logical_tensors
+        # Use batched approach similar to fsdp_sglang.py
+        for batch in self._get_named_tensor_buckets(named_tensors, update_weights_bucket_bytes):
+            # On each rank, serialize a batch of (name, tensor) tuples.
+            # named_tensors_batch will be a list like:
+            # [(name0, serialized_tensor0_tp0), (name1, serialized_tensor1_tp0), ...]
+            named_tensors_batch = [
+                (name, MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor)))
+                for name, tensor in batch
             ]
 
-            # Serialize once and reuse for all TP ranks to avoid memory explosion
-            serialized_update_tensors = MultiprocessingSerializer.serialize(update_tensors, output_str=True)
-            # Clear intermediate data to free memory
-            del update_tensors, gathered_serialized_batches
-            clear_memory()
-            
-            kwargs = {
-                "serialized_named_tensors": [serialized_update_tensors for _ in range(self.tp_size)],
-                "load_format": load_format,
-                "flush_cache": False,
-            }
+            if self._ipc_gather_src == dist.get_rank():
+                # On rank 0, prepare a list to hold the gathered batches from all ranks.
+                gathered_serialized_batches = [None for _ in range(dist.get_world_size(self._ipc_gather_group))]
+            else:
+                gathered_serialized_batches = None
 
-            logger.info("Sending weights to SGLang")
-            ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
-            ray.get(ref)
-            clear_memory()
-            
-            # Clear serialized data
-            del serialized_update_tensors, kwargs
-            clear_memory()
-            
-            # Flush cache after all updates
+            # Gather the named_tensors_batch from all ranks to rank 0.
+            # After this, on rank 0, gathered_serialized_batches will be a list of lists:
+            # [ [ (name0, s_t0_tp0), (name1, s_t1_tp0), ... ],  # batch from TP rank 0
+            #   [ (name0, s_t0_tp1), (name1, s_t1_tp1), ... ],  # batch from TP rank 1
+            #   ... ]
+            # On other ranks, gathered_serialized_batches will be None.
+            dist.gather_object(
+                obj=named_tensors_batch,
+                object_gather_list=gathered_serialized_batches,
+                dst=self._ipc_gather_src,
+                group=self._ipc_gather_group,
+            )
+
+            if dist.get_rank() == self._ipc_gather_src:
+                # Use zip(*) to "transpose" the data structure.
+                # This groups the serialized parts for each individual tensor across all TP ranks.
+                # Example: from [[(n0, t0_tp0), (n1, t1_tp0)], [(n0, t0_tp1), (n1, t1_tp1)]]
+                # to [ ( (n0, t0_tp0), (n0, t0_tp1) ), ( (n1, t1_tp0), (n1, t1_tp1) ) ]
+                logical_tensors = zip(*gathered_serialized_batches, strict=True)
+
+                # Create LocalSerializedTensor objects for each logical tensor
+                update_tensors = [
+                    (
+                        tensor_group[0][0],  # Get the name from the first rank's data.
+                        LocalSerializedTensor(
+                            # 'rank_part' is the (name, serialized_tensor) tuple from one specific rank.
+                            values=[rank_part[1] for rank_part in tensor_group]
+                        ),
+                    )
+                    for tensor_group in logical_tensors
+                    # each tensor_group is like ( (n0, t0_tp0), (n0, t0_tp1) )
+                ]
+
+                # Serialize once and reuse for all TP ranks to avoid memory explosion
+                serialized_update_tensors = MultiprocessingSerializer.serialize(update_tensors, output_str=True)
+                
+                logger.info(f"Sending batch of {len(update_tensors)} parameters to SGLang")
+                
+                # Clear intermediate data to free memory
+                del update_tensors, gathered_serialized_batches
+                clear_memory()
+                
+                kwargs = {
+                    "serialized_named_tensors": [serialized_update_tensors for _ in range(self.tp_size)],
+                    "load_format": load_format,
+                    "flush_cache": False,
+                }
+                ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
+                ray.get(ref)
+                clear_memory()
+                
+                # Clear serialized data
+                del serialized_update_tensors, kwargs
+                clear_memory()
+        
+        # Flush cache after all updates
+        if dist.get_rank() == self._ipc_gather_src:
             ref = self._ipc_engine.flush_cache.remote()
             ray.get(ref)
             clear_memory()
             
         logger.info("Sharded weight update completed")
+    
+    def _get_named_tensor_buckets(self, iterable, bucket_bytes):
+        """
+        Group tensors into buckets based on a specified size in bytes.
+        Similar to the implementation in fsdp_sglang.py.
+        
+        Args:
+            iterable: An iterator of tuples containing tensor names and tensors.
+            bucket_bytes: The maximum size of each bucket in bytes.
+
+        Yields:
+            Lists of tuples, where each tuple contains a tensor name and its corresponding tensor.
+        """
+        if bucket_bytes <= 0:
+            raise ValueError(f"bucket_bytes must be greater than 0, got {bucket_bytes}")
+
+        current_bucket = []
+        current_size = 0
+        for name, tensor in iterable:
+            tensor_size = tensor.element_size() * tensor.numel()
+            if current_size + tensor_size > bucket_bytes:
+                if current_bucket:
+                    yield current_bucket
+                current_bucket = [(name, tensor)]
+                current_size = tensor_size
+            else:
+                current_bucket.append((name, tensor))
+                current_size += tensor_size
+
+        if current_bucket:
+            yield current_bucket
