@@ -90,42 +90,49 @@ class UpdateWeightFromTensor:
             del state_dict
             clear_memory()
 
-            if use_flattened_tensor_bucket:
-                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-                metadata = flattened_tensor_bucket.get_metadata()
-
-                flattened_tensor_data = {
-                    "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-                    "metadata": metadata,
-                }
-                serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
-            else:
-                serialized_tensors = MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+            # Use bucketing for better memory management in full_params mode
+            update_weights_bucket_megabytes = getattr(self.args, 'fsdp_update_weights_bucket_megabytes', 512)
+            update_weights_bucket_bytes = int(update_weights_bucket_megabytes) << 20
             
-            # Clear memory after serialization
-            clear_memory()
-
-            serialized_named_tensors = (
-                [None] * dist.get_world_size(self._ipc_gather_group) if self._ipc_gather_src == dist.get_rank() else None
-            )
-            dist.gather_object(
-                serialized_tensors,
-                object_gather_list=serialized_named_tensors,
-                dst=self._ipc_gather_src,
-                group=self._ipc_gather_group,
-            )
-            clear_memory()
-
-            if dist.get_rank() == self._ipc_gather_src:
-                kwargs = {
-                    "serialized_named_tensors": serialized_named_tensors,
-                }
+            for batch in self._get_named_tensor_buckets(named_tensors, update_weights_bucket_bytes):
                 if use_flattened_tensor_bucket:
-                    kwargs["load_format"] = "flattened_bucket"
+                    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=batch)
+                    metadata = flattened_tensor_bucket.get_metadata()
 
-                ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
-                ray.get(ref)
+                    flattened_tensor_data = {
+                        "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                        "metadata": metadata,
+                    }
+                    serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+                else:
+                    serialized_tensors = MultiprocessingSerializer.serialize(batch, output_str=True)
+                
+                # Clear memory after serialization
                 clear_memory()
+
+                serialized_named_tensors = (
+                    [None] * dist.get_world_size(self._ipc_gather_group) if self._ipc_gather_src == dist.get_rank() else None
+                )
+                dist.gather_object(
+                    serialized_tensors,
+                    object_gather_list=serialized_named_tensors,
+                    dst=self._ipc_gather_src,
+                    group=self._ipc_gather_group,
+                )
+                clear_memory()
+
+                if dist.get_rank() == self._ipc_gather_src:
+                    kwargs = {
+                        "serialized_named_tensors": serialized_named_tensors,
+                    }
+                    if use_flattened_tensor_bucket:
+                        kwargs["load_format"] = "flattened_bucket"
+
+                    ref = self._ipc_engine.update_weights_from_tensor.remote(**kwargs)
+                    ray.get(ref)
+                    clear_memory()
+                    
+                    logger.info(f"Completed batch of {len(batch)} parameters in full_params mode")
         else:
             logger.info("Using SHARDED_STATE_DICT path")
             # Use SHARDED_STATE_DICT following veRL pattern
@@ -146,7 +153,7 @@ class UpdateWeightFromTensor:
         logger.info("Starting sharded weight update")
         
         load_format = None
-        update_weights_bucket_megabytes = getattr(self.args, 'update_weights_bucket_megabytes', 100)
+        update_weights_bucket_megabytes = getattr(self.args, 'fsdp_update_weights_bucket_megabytes', 100)
         update_weights_bucket_bytes = int(update_weights_bucket_megabytes) << 20
         
         # Use batched approach similar to fsdp_sglang.py

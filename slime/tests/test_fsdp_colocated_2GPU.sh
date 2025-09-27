@@ -67,6 +67,7 @@ MISC_ARGS=(
    # Set to true for FULL_STATE_DICT mode, false for SHARDED_STATE_DICT mode (default)
    # --fsdp-full-params  # Uncomment this line to enable full params mode
    # Comment out the above line to use sharded mode (default)
+   --update-weights-bucket-megabytes 512
 )
 
 # launch the master node of ray in container
