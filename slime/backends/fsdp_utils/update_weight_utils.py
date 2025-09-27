@@ -158,6 +158,8 @@ class UpdateWeightFromTensor:
                 (name, MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor)))
                 for name, tensor in batch
             ]
+            del batch
+            clear_memory()
 
             if self._ipc_gather_src == dist.get_rank():
                 # On rank 0, prepare a list to hold the gathered batches from all ranks.
@@ -177,6 +179,8 @@ class UpdateWeightFromTensor:
                 dst=self._ipc_gather_src,
                 group=self._ipc_gather_group,
             )
+            del named_tensors_batch
+            clear_memory()
 
             if dist.get_rank() == self._ipc_gather_src:
                 # Use zip(*) to "transpose" the data structure.
@@ -184,6 +188,8 @@ class UpdateWeightFromTensor:
                 # Example: from [[(n0, t0_tp0), (n1, t1_tp0)], [(n0, t0_tp1), (n1, t1_tp1)]]
                 # to [ ( (n0, t0_tp0), (n0, t0_tp1) ), ( (n1, t1_tp0), (n1, t1_tp1) ) ]
                 logical_tensors = zip(*gathered_serialized_batches, strict=True)
+                del gathered_serialized_batches
+                clear_memory()
 
                 # Create LocalSerializedTensor objects for each logical tensor
                 update_tensors = [
@@ -204,7 +210,7 @@ class UpdateWeightFromTensor:
                 logger.info(f"Sending batch of {len(update_tensors)} parameters to SGLang")
                 
                 # Clear intermediate data to free memory
-                del update_tensors, gathered_serialized_batches
+                del update_tensors
                 clear_memory()
                 
                 kwargs = {
