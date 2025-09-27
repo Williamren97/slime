@@ -9,10 +9,6 @@ from slime.utils.profiler import init_global_profiler, shutdown_global_profiler
 
 
 def train(args):
-    # Initialize global profiler if config provided
-    if hasattr(args, 'profiler_config') and args.profiler_config:
-        init_global_profiler(args.profiler_config)
-    
     # allocate the GPUs
     pgs = create_placement_groups(args)
     wandb_run_id = init_wandb_primary(args)
@@ -52,6 +48,10 @@ def train(args):
     assert len(set(start_rollout_ids)) == 1
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
+    
+    # Initialize global profiler after all actors are initialized
+    if hasattr(args, 'profiler_config') and args.profiler_config:
+        init_global_profiler(args.profiler_config)
 
     if args.rollout_global_dataset:
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))

@@ -43,13 +43,13 @@ def enable_memory_visualize(config=None):
     if config and hasattr(config, 'torch_memory'):
         max_entries = config.torch_memory.trace_alloc_max_entries
     
-    torch.cuda.memory._record_memory_history(
-        enabled=True,
-        alloc_trace_record_input_shapes=True,
-        alloc_trace_device_memory=True,
-        alloc_trace_max_entries=max_entries,
-    )
-    logger.info(f"Memory visualization enabled (max_entries={max_entries})")
+    try:
+        # Try minimal API that should work across PyTorch versions
+        torch.cuda.memory._record_memory_history(enabled=True)
+        logger.info("Memory visualization enabled (minimal API)")
+    except Exception as e:
+        logger.warning(f"Failed to enable memory visualization: {e}")
+        return
 
 
 def dump_memory_snapshot(out_dir: str, prefix: str = "memory_snapshot"):
@@ -57,6 +57,12 @@ def dump_memory_snapshot(out_dir: str, prefix: str = "memory_snapshot"):
     if not hasattr(torch.cuda.memory, '_dump_snapshot'):
         logger.warning("Memory snapshot not supported in this PyTorch version")
         return
+    
+    # Ensure memory recording is enabled in this process
+    try:
+        torch.cuda.memory._record_memory_history(enabled=True)
+    except Exception as e:
+        logger.warning(f"Failed to enable memory recording in this process: {e}")
         
     os.makedirs(out_dir, exist_ok=True)
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -67,8 +73,18 @@ def dump_memory_snapshot(out_dir: str, prefix: str = "memory_snapshot"):
     try:
         torch.cuda.memory._dump_snapshot(filepath)
         logger.info(f"Memory snapshot saved to {filepath}")
+        
+        # Also log current memory usage for immediate feedback
+        mem_info = available_memory()
+        logger.info(f"Current memory at {prefix}: {mem_info}")
     except Exception as e:
-        logger.error(f"Failed to dump memory snapshot: {e}")
+        # If snapshot fails, just log memory usage instead
+        logger.warning(f"Failed to dump memory snapshot: {e}")
+        try:
+            mem_info = available_memory()
+            logger.info(f"Memory usage at {prefix}: {mem_info}")
+        except Exception:
+            pass
 
 
 class MemorySnapshotSampler:

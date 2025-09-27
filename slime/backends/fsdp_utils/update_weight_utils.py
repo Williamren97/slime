@@ -19,7 +19,7 @@ from .fsdp_version_utils import (
     preprocess_tensor_for_update_weights as _preprocess_tensor_for_update_weights,
     verify_model_is_fsdp_v2,
 )
-from slime.utils.memory_utils import clear_memory
+from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.profiler import snapshot_memory
 
 # Set up logger for FSDP weight updates
@@ -83,6 +83,7 @@ class UpdateWeightFromTensor:
         
         # Memory snapshot before weight update
         snapshot_memory("before_weight_update")
+        print_memory("before_weight_update")
         
         monkey_patch_torch_reductions()
         
@@ -99,6 +100,7 @@ class UpdateWeightFromTensor:
             
             # Memory snapshot after tensor preprocessing
             snapshot_memory("after_preprocessing")
+            print_memory("after_preprocessing")
 
             if use_flattened_tensor_bucket:
                 flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
@@ -151,6 +153,7 @@ class UpdateWeightFromTensor:
         
         # Memory snapshot after weight update completion
         snapshot_memory("after_weight_update")
+        print_memory("after_weight_update")
         
         logger.info("Weight update completed")
     
