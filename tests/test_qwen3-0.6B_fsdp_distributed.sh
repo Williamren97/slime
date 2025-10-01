@@ -10,6 +10,11 @@ sleep 3
 pkill -9 ray
 pkill -9 python
 
+# Clean up Ray temporary files
+export RAY_TMPDIR="/tmp/ray_$(whoami)"
+rm -rf $RAY_TMPDIR
+mkdir -p $RAY_TMPDIR
+
 set -ex
 
 # will prevent ray from buffering stdout/stderr
@@ -60,7 +65,7 @@ SGLANG_ARGS=(
 )
 
 # launch the master node of ray in container
-ray start --head --node-ip-address 127.0.0.1 --num-gpus 4 --disable-usage-stats
+ray start --head --node-ip-address 127.0.0.1 --num-gpus 4 --disable-usage-stats --temp-dir="$RAY_TMPDIR"
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
@@ -79,3 +84,14 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${GRPO_ARGS[@]} \
    ${DISTRIBUTED_ARGS[@]} \
    ${SGLANG_ARGS[@]}
+
+# Cleanup function to run on script exit
+cleanup() {
+    echo "Cleaning up Ray temporary files..."
+    ray stop --force 2>/dev/null || true
+    rm -rf "$RAY_TMPDIR" 2>/dev/null || true
+    echo "Cleanup completed."
+}
+
+# Set trap to run cleanup on script exit
+trap cleanup EXIT
