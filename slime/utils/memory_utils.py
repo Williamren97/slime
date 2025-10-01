@@ -35,13 +35,19 @@ def print_memory(msg):
 def enable_memory_visualize():
     """Enable memory history recording for debugging."""
     if hasattr(torch.cuda, "memory") and hasattr(torch.cuda.memory, "memory_snapshot"):
-        torch.cuda.memory._record_memory_history(
-            enabled=True, 
-            alloc_trace_record_context=True, 
-            alloc_trace_max_entries=100000,
-            alloc_trace_record_context_cpp=True
-        )
-        print("Memory visualization enabled")
+        try:
+            torch.cuda.memory._record_memory_history(
+                enabled=True, 
+                alloc_trace_record_context=True, 
+                alloc_trace_max_entries=100000
+            )
+            print("Memory visualization enabled")
+        except Exception as e:
+            try:
+                torch.cuda.memory._record_memory_history(enabled=True)
+                print("Memory visualization enabled (basic mode)")
+            except Exception as e2:
+                print(f"Warning: Failed to enable memory visualization: {e2}")
     else:
         print("Warning: torch.cuda.memory.memory_snapshot not available, memory visualization disabled")
 
