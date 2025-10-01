@@ -88,9 +88,10 @@ def analyze_directory(dir_path):
     
     print(f"🔍 Found {len(pickle_files)} pickle files in {dir_path}")
     
-    # Sort files and get the last one
+    # Sort files and get the last one.
     sorted_files = sorted(pickle_files)
     last_file = sorted_files[-1]
+
     
     print(f"📋 Analyzing the most recent file:")
     print(f"\n{'='*80}")
