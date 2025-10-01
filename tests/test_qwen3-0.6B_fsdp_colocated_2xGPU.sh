@@ -95,7 +95,13 @@ FSDP_ARGS=(
    # --fsdp-full-params  # Uncomment this line to enable full params mode
 
    # Set the bucket size for weight update
-   -- update-weights-bucket-size 512 * 1024 * 1024 # 512MB
+   --update-weights-bucket-size 536870912 # 512MB
+)
+
+MEMORY_DEBUG_ARGS=(
+   --enable-memory-visualize
+   --memory-snapshot-out-dir ./mem_snapshots_2gpu
+   --memory-snapshot-interval 50
 )
 
 # launch the master node of ray in container with temp directory setting
@@ -118,7 +124,9 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${GRPO_ARGS[@]} \
    ${DISTRIBUTED_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${WANDB_ARGS[@]}
+   ${WANDB_ARGS[@]} \
+   ${FSDP_ARGS[@]} \
+   ${MEMORY_DEBUG_ARGS[@]}
 
 # Cleanup function to run on script exit
 cleanup() {

@@ -64,6 +64,12 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
 )
 
+MEMORY_DEBUG_ARGS=(
+   --enable-memory-visualize
+   --memory-snapshot-out-dir ./mem_snapshots_4gpu
+   --memory-snapshot-interval 100
+)
+
 # launch the master node of ray in container
 ray start --head --node-ip-address 127.0.0.1 --num-gpus 4 --disable-usage-stats --temp-dir="$RAY_TMPDIR"
 
@@ -83,7 +89,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${DISTRIBUTED_ARGS[@]} \
-   ${SGLANG_ARGS[@]}
+   ${SGLANG_ARGS[@]} \
+   ${MEMORY_DEBUG_ARGS[@]}
 
 # Cleanup function to run on script exit
 cleanup() {
